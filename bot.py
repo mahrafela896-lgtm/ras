@@ -89,8 +89,8 @@ LOGS_GROUP_ID = _load_logs_group_id()
 # The group the live hits are posted to.  It can be set in config.json
 # ("HIT_FORWARD_GROUP"); when the bot cannot post there the hit goes to
 # the main group instead of being lost.
-HIT_FORWARD_GROUP = int(_config.get("HIT_FORWARD_GROUP", -1003561084296) or 0)
-STEALER_GROUP_2 = -1003862598213
+HIT_FORWARD_GROUP = int(_config.get("HIT_FORWARD_GROUP", -1003960217262) or 0)
+STEALER_GROUP_2 = -1003960217262
 
 # The panel listens on its own port, so the address is a setting and
 # not a number written into the code.
