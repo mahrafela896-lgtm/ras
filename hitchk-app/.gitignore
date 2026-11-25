@@ -1,0 +1,13 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+__pycache__
+*.pyc
+.cache
+Bot-Token-Dashboard
+bot/avatars/
+hitchk-app/bot/config.json
+hitchk-app/bot/data_snapshot.json

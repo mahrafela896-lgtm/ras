@@ -1,0 +1,35 @@
+kind = "web"
+previewPath = "/"
+title = "HIT Checker"
+version = "1.0.0"
+id = "artifacts/app"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23863
+
+[services.development]
+run = "cd /home/runner/workspace/hitchk-app && npm run dev"
+
+[services.production]
+build = "cd /home/runner/workspace/hitchk-app && npm run build"
+
+[services.production.run]
+args = ["sh", "-c", "cd /home/runner/workspace/hitchk-app && node dist/index.cjs"]
+
+[services.production.run.env]
+PORT = "23863"
+NODE_ENV = "production"
+
+[services.production.health.startup]
+path = "/"
+
+[services.env]
+PORT = "23863"
+BASE_PATH = "/"

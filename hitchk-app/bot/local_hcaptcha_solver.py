@@ -1,0 +1,1857 @@
+"""A local captcha solver -- a real browser gets the token.
+
+No outside service is used.  hCaptcha and Turnstile put the token in a
+hidden field and reCAPTCHA v3 hands it to a javascript callback, so a
+real browser can read it out.  That costs a browser start, but no key,
+no credit and nothing to leak.
+"""
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
+import time
+
+logger = logging.getLogger("local_captcha")
+
+# The solver says what it does in a file of its own.  The worker of
+# the browser runs apart from the bot, and what it says would
+# otherwise be lost: the words go nowhere when the pipe is thrown
+# away.
+_THE_LOG_FILE = os.environ.get("SOLVER_LOG_FILE") or "/tmp/lc_solver.log"
+try:
+    if not logger.handlers:
+        _h = logging.FileHandler(_THE_LOG_FILE, encoding="utf-8")
+        _h.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(_h)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+except Exception:
+    pass
+
+# The browser has to say the same name as the client that hands the
+# token in.  A token belongs to the browser that won it, so when the
+# two disagree the token is worth nothing.
+#
+# The browser on the machine is a headless build of another version.
+# It is told the name the api client uses, through the browser's own
+# setting, so the name, the client hints and the handshake all belong
+# to one browser.
+import os as _os
+import sys as _sys
+
+_bot_dir = _os.path.dirname(_os.path.abspath(__file__))
+if _bot_dir not in _sys.path:
+    _sys.path.insert(0, _bot_dir)
+
+try:
+    from browser_identity import (apply_browser_identity, client_hints_metadata,
+                                  USER_AGENT as UA)
+except Exception:  # the browser keeps its own name when the module is missing
+    UA = None
+    apply_browser_identity = None
+    client_hints_metadata = None
+
+# the small things that give a browser away
+STEALTH = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+const q = navigator.permissions && navigator.permissions.query;
+if (q) { navigator.permissions.query = (p) => (
+    p && p.name === 'notifications'
+      ? Promise.resolve({state: Notification.permission})
+      : q.call(navigator.permissions, p)); }
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+
+// The screen.  A browser that says it is a computer with one screen
+// of a size nobody has is easy to pick out.  Each one is set on its
+// own, because one that will not go through must not stop the rest.
+//
+// The size is the one the fingerprint says too: the browser and the
+// request that carries the answer have to be the same computer.
+const _sizes = [[1728, 1117, 24]];
+const _size = _sizes[0];
+const _set = (obj, name, value) => {
+  try { Object.defineProperty(obj, name, {get: () => value, configurable: true}); }
+  catch (e) {}
+};
+_set(window, 'innerWidth', _size[0] - 16);
+_set(window, 'innerHeight', _size[1] - 74);
+_set(window, 'outerWidth', _size[0]);
+_set(window, 'outerHeight', _size[1]);
+_set(window, 'screenX', 0);
+_set(window, 'screenY', 0);
+_set(window, 'screenLeft', 0);
+_set(window, 'screenTop', 0);
+_set(window, 'devicePixelRatio', 2);
+_set(navigator, 'deviceMemory', 8);
+_set(navigator, 'maxTouchPoints', 0);
+_set(navigator, 'pdfViewerEnabled', true);
+_set(navigator, 'webdriver', undefined);
+const _screen = window.screen;
+if (_screen) {
+  _set(_screen, 'width', _size[0]);
+  _set(_screen, 'height', _size[1]);
+  _set(_screen, 'availWidth', _size[0]);
+  _set(_screen, 'availHeight', _size[1] - 24);
+  _set(_screen, 'colorDepth', _size[2]);
+  _set(_screen, 'pixelDepth', _size[2]);
+}
+// a computer with one screen has no screens to choose from
+try {
+  const _mm = window.matchMedia.bind(window);
+  window.matchMedia = (q) => {
+    try {
+      const r = _mm(q);
+      if (q && /display/.test(q)) { r.matches = false; }
+      return r;
+    } catch (e) {
+      return {matches: false, media: q, addListener() {}, removeListener() {},
+              addEventListener() {}, removeEventListener() {},
+              dispatchEvent() { return false; }};
+    }
+  };
+} catch (e) {}
+
+// The graphics card.  A machine with no graphics card draws with the
+// software renderer, and the software renderer is one of the things a
+// headless browser is known by.  So the card is named.
+try {
+  const _getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function (p) {
+    const _ext = this.getExtension('WEBGL_debug_renderer_info');
+    if (_ext && p === _ext.UNMASKED_RENDERER_WEBGL) {
+      return 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)';
+    }
+    if (_ext && p === _ext.UNMASKED_VENDOR_WEBGL) {
+      return 'Google Inc. (Apple)';
+    }
+    if (p === 37445) { return 'Apple GPU'; }              // the renderer
+    if (p === 37446) { return 'Apple'; }                  // the vendor
+    return _getParameter.call(this, p);
+  };
+} catch (e) {}
+"""
+
+# the token the page hands over
+TOKEN_JS = """
+() => {
+    const el = document.querySelector(
+        'textarea[name="h-captcha-response"], input[name="cf-turnstile-response"]');
+    if (el && el.value) return el.value;
+    const t = window.__captchaToken;
+    if (!t) return "";
+    // the enterprise captcha hands over an object with the token and
+    // the ekey in it
+    if (typeof t === 'object') return t.response || "";
+    return t;
+}
+"""
+
+# the ekey that comes with the enterprise token
+EKEY_JS = """
+() => {
+    const e = window.__captchaEkey;
+    if (!e) return "";
+    if (typeof e === 'object') return e.ekey || "";
+    return e;
+}
+"""
+
+# the last ekey the solver got, for the callers that need it
+LAST_EKEY = ""
+
+# The box that hCaptcha puts up when it wants to be sure of the person.
+# It is in a frame of hCaptcha's own, and the frame says which kind it
+# is: the one that says "checkbox" is the one to tick.
+TICK_THE_BOX = """
+() => {
+    const el = document.querySelector('#checkbox');
+    if (!el) { return 'no box'; }
+    try { el.click(); return 'ticked'; } catch (e) { return 'the tick failed: ' + e; }
+}
+"""
+
+
+def _unquote(value):
+    """A part of an address, the way a browser reads it."""
+    try:
+        from urllib.parse import unquote
+        return unquote(value)
+    except Exception:
+        return value
+
+# the answer stripe's own captcha gave, and the request data it gave
+# the captcha.  That answer is about the request data that is on the
+# page now, which is the one stripe is waiting for.
+LAST_STRIPE_TOKEN = ""
+LAST_STRIPE_RQDATA = ""
+
+# reCAPTCHA v3 hands the token to a callback, so catch it on the way
+RECAPTCHA_HOOK = """
+(function () {
+    window.__captchaToken = "";
+    const install = () => {
+        try {
+            if (window.grecaptcha && window.grecaptcha.execute && !window.grecaptcha.__patched) {
+                const orig = window.grecaptcha.execute.bind(window.grecaptcha);
+                window.grecaptcha.execute = function (...args) {
+                    return orig(...args).then((tok) => {
+                        window.__captchaToken = tok;
+                        return tok;
+                    });
+                };
+                window.grecaptcha.__patched = true;
+            }
+        } catch (e) {}
+    };
+    install();
+    const timer = setInterval(install, 200);
+    setTimeout(() => clearInterval(timer), 40000);
+})();
+"""
+
+# the hCaptcha widget, for a page that does not put one up itself.
+# The second argument is the rqdata, which Stripe and other enterprise
+# users hand over: it needs the enterprise script.
+HCAPTCHA_WIDGET = """
+(args) => {
+    const sitekey = args[0], rqdata = args[1] || '';
+    const keep = (t) => {
+        // the enterprise captcha hands over an object with the token
+        // and the ekey
+        if (t && typeof t === 'object') {
+            window.__captchaToken = t.response || '';
+            window.__captchaEkey = t.ekey || '';
+        } else {
+            window.__captchaToken = t || '';
+        }
+    };
+    try {
+        if (!window.hcaptcha) {
+            if (!document.getElementById('__lc_api')) {
+                const s = document.createElement('script');
+                s.id = '__lc_api';
+                s.src = rqdata
+                    ? 'https://js.hcaptcha.com/1/api.js?enterprise.js'
+                    : 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                s.async = true;
+                s.defer = true;
+                document.head.appendChild(s);
+            }
+            return 'loading';
+        }
+        if (rqdata) {
+            // The enterprise captcha, the way stripe asks for it: the
+            // site key and the request data go in one call, and the
+            // answer comes back by itself.  There is no box to click.
+            // A captcha of our own asking for the same site key is a
+            // different captcha, and it is answered with a picture.
+            if (window.__lc_started) {
+                return 'the widget is up';
+            }
+            window.__lc_started = true;
+            try {
+                const p = window.hcaptcha.execute(sitekey, {
+                    enterprisePayload: { rqdata: rqdata },
+                    async: true
+                });
+                if (p && p.then) {
+                    p.then(keep).catch((e) => { window.__lc_error = 'execute: ' + e; });
+                }
+            } catch (e) {
+                window.__lc_error = 'execute threw: ' + e;
+                return 'execute threw: ' + e;
+            }
+            return 'the widget is up';
+        }
+        const opts = {
+            callback: keep,
+            'error-callback': (e) => { window.__lc_error = String(e); }
+        };
+        if (rqdata) {
+            // The enterprise captcha has no box on the page: it is asked
+            // for with the site key itself, and the request data goes
+            // in its own place.  An ordinary captcha asked with the
+            // request data is answered with a picture instead of the
+            // answer.
+            opts.enterprisePayload = { rqdata: rqdata };
+            try {
+                window.__lc_widget = window.hcaptcha.render(sitekey, opts);
+            } catch (e) {
+                window.__lc_widget = null;
+                window.__lc_error = 'the render failed: ' + e;
+                return 'the render failed: ' + e;
+            }
+            window.__lc_started = true;
+            try {
+                const p = window.hcaptcha.execute(window.__lc_widget, {async: true});
+                if (p && p.then) {
+                    p.then(keep).catch((e) => { window.__lc_error = 'execute: ' + e; });
+                }
+            } catch (e) { window.__lc_error = 'execute threw: ' + e; }
+            return 'the widget is up';
+        }
+        const box = document.createElement('div');
+        box.className = 'h-captcha';
+        box.dataset.sitekey = sitekey;
+        box.style.position = 'fixed';
+        box.style.left = '10px';
+        box.style.top = '10px';
+        box.style.zIndex = '2147483647';
+        document.body.appendChild(box);
+        opts.sitekey = sitekey;
+        try {
+            window.__lc_widget = window.hcaptcha.render(box, opts);
+        } catch (e) {
+            window.__lc_widget = null;
+            window.__lc_error = 'the render failed: ' + e;
+            return 'the render failed: ' + e;
+        }
+        window.__lc_started = true;
+        try {
+            const p = window.hcaptcha.execute(window.__lc_widget, {async: true});
+            if (p && p.then) {
+                p.then(keep).catch((e) => { window.__lc_error = 'execute: ' + e; });
+            }
+        } catch (e) { window.__lc_error = 'execute threw: ' + e; }
+        return 'the widget is up';
+    } catch (e) {
+        return 'outer ' + e;
+    }
+}
+"""
+
+# the same for reCAPTCHA v3, which is never a widget
+RECAPTCHA_WIDGET = """
+(args) => {
+    const sitekey = args[0];
+    try {
+        if (!window.grecaptcha) {
+            if (!document.getElementById('__lc_grec_script')) {
+                const s = document.createElement('script');
+                s.id = '__lc_grec_script';
+                s.src = 'https://www.google.com/recaptcha/api.js?render=' + sitekey;
+                s.async = true;
+                s.defer = true;
+                document.head.appendChild(s);
+            }
+            return false;
+        }
+        if (window.__lc_grec_done) return true;
+        window.__lc_grec_done = true;
+        window.grecaptcha.ready(() => {
+            window.grecaptcha.execute(sitekey, {}).then((tok) => {
+                window.__captchaToken = tok;
+            }).catch(() => {});
+        });
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+"""
+
+
+# The browser is kept open between the calls: a hitter runs many
+# cards through one session, and starting a browser every time is slow.
+# The playwright session has to stay open as well, because the browser
+# lives inside it and dies with it.
+_BROWSER = None
+_PW = None
+_PW_LOOP = None
+_BROWSER_AT = 0.0
+_BROWSER_IDLE = 180.0
+_BROWSER_PROXY = None
+
+
+def _clear_the_lock():
+    """Take the lock of a browser that died away.
+
+    A browser that is killed leaves its lock in the profile, and the
+    next browser refuses to start on it.  Then every captcha fails for
+    a reason that has nothing to do with the captcha.
+    """
+    try:
+        folder = _profile_dir()
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            path = os.path.join(folder, name)
+            if os.path.islink(path) or os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+async def _get_browser(launch):
+    """The browser, opened once and kept for a while.
+
+    The address the browser goes out through is part of the browser, so
+    a new address means a new browser.
+    """
+    global _BROWSER, _PW, _PW_LOOP, _BROWSER_AT, _BROWSER_PROXY
+    wanted = launch.get("proxy")
+    wanted = wanted.get("server") if isinstance(wanted, dict) else wanted
+    if _BROWSER is not None:
+        # The browser that answered the last captcha has the memory of
+        # it, and the captcha of the next one knows that browser.  So
+        # every captcha gets a browser of its own, and the old one is
+        # closed before the new one is opened: the memory of this box
+        # is small, and two browsers at once is too much.
+        try:
+            await _BROWSER.close()
+        except Exception:
+            pass
+        _BROWSER = None
+    if _PW is None:
+        from playwright.async_api import async_playwright
+        _PW = await async_playwright().start()
+        _PW_LOOP = asyncio.get_event_loop()
+    ctx = None
+    try:
+        ctx = await _PW.chromium.launch_persistent_context(
+            _profile_dir(), **_the_browser(), bypass_csp=True,
+            **PAGE_OPTIONS, **launch)
+    except Exception as e:
+        logger.debug("the saved profile browser did not start: %s", e)
+        # a browser that was killed leaves its lock behind, and the next
+        # one refuses to start on it
+        _clear_the_lock()
+        try:
+            ctx = await _PW.chromium.launch_persistent_context(
+                _profile_dir(), **_the_browser(), bypass_csp=True,
+                **PAGE_OPTIONS, **launch)
+        except Exception as e2:
+            logger.debug("the saved profile browser did not start again: %s", e2)
+            browser = await _PW.chromium.launch(**launch)
+            ctx = await browser.new_context(bypass_csp=True, **PAGE_OPTIONS)
+    _BROWSER = ctx
+    _BROWSER_AT = time.time()
+    _BROWSER_PROXY = wanted
+    return ctx
+
+
+async def _close_browser_if_idle():
+    """Close the browser when it has been sitting still for a while."""
+    global _BROWSER, _PW
+    if _BROWSER is None:
+        return
+    if (time.time() - _BROWSER_AT) < _BROWSER_IDLE:
+        return
+    try:
+        await _BROWSER.close()
+    except Exception:
+        pass
+    _BROWSER = None
+    if _PW is not None:
+        try:
+            await _PW.stop()
+        except Exception:
+            pass
+        _PW = None
+
+
+# The clock and the size the page in the browser has.  A browser whose
+# clock does not match the country it claims to be in is easy to pick
+# out, and so is one whose screen is a size nobody has.
+PAGE_OPTIONS = {
+    "locale": "en-US",
+    "timezone_id": "America/Chicago",
+    "viewport": {"width": 1728, "height": 1117},
+}
+
+
+def _profile_dir():
+    """A profile of its own for each browser.
+
+    A profile that is saved is the same browser every day, and a
+    captcha that sees the same browser twice in a day knows it.  So
+    every browser gets a profile that has never been used, and the
+    old ones are taken away so that the disk does not fill up.
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    try:
+        path = _tempfile.mkdtemp(prefix="lc_profile_")
+        return path
+    except Exception:
+        return "/tmp"
+
+
+def _the_browser():
+    """The browser of the version the request library pretends to be.
+
+    The browser that answers the captcha has to be the same version as
+    the request that carries the answer.  So the browser of that exact
+    version is used, when it is on the machine.
+    """
+    try:
+        from browser_identity import CHROME_VERSION
+    except Exception:
+        CHROME_VERSION = ""
+    # The memory of this box is small, and a browser that is too big is
+    # killed by the kernel in the middle of a solve.  So the browser is
+    # told to be small, and to keep to one process.
+    _flags = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process",
+        "--renderer-process-limit=1",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints",
+        "--js-flags=--max-old-space-size=192",
+    ]
+    if CHROME_VERSION:
+        for path in ("/opt/chrome-%s/chrome" % CHROME_VERSION,
+                     "/opt/chrome/chrome"):
+            if os.path.exists(path):
+                return {"channel": "chrome", "executable_path": path,
+                        "args": _flags}
+    return {"channel": "chrome", "args": _flags}
+
+
+# The proxies that are worth trying, and the file they are in.
+PROXY_FILE = "/root/hitchecker/bot/user_proxies.json"
+
+# The addresses the machine holds for itself.  The user file is for
+# the addresses a person paid for; this one is the pool of the
+# machine, and it is used when there is no user file.
+PROXY_POOL_FILE = "/root/hitchecker/proxy.txt"
+_bad_proxies = set()
+
+
+def _the_machines_pool():
+    """The addresses the machine holds for itself."""
+    out = []
+    try:
+        with open(PROXY_POOL_FILE, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if raw and not raw.startswith("#"):
+                    out.append(raw)
+    except Exception:
+        return []
+    return out
+
+
+def _working_proxies():
+    """The proxies that answered the last time they were tried.
+
+    hCaptcha gives up on an address that has failed, so a proxy that
+    does not work is not asked again.
+
+    The addresses a person paid for are used first, and the pool of
+    the machine after them, so there is always somewhere to ask from.
+    """
+    global _bad_proxies
+    try:
+        import json
+        with open(PROXY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = []
+    out = []
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, dict) and isinstance(v.get("proxies"), list):
+                out.extend(v["proxies"])
+            elif isinstance(v, list):
+                out.extend(v)
+    elif isinstance(data, list):
+        out = list(data)
+    if not out:
+        out = _the_machines_pool()
+    return [p for p in out
+            if isinstance(p, str) and p.count(":") >= 3 and p not in _bad_proxies]
+
+
+def _playwright_proxy(proxy):
+    """The proxy for the browser.
+
+    The proxy list uses "host:port:user:pass", and a plain
+    "http://host:port" works as well.
+    """
+    if not proxy or proxy == "NONE":
+        return None
+    try:
+        proxy = str(proxy).strip()
+        scheme = "http"
+        if "://" in proxy:
+            scheme, proxy = proxy.split("://", 1)
+        if "@" in proxy:
+            creds, hostport = proxy.rsplit("@", 1)
+            user, _, pw = creds.partition(":")
+            return {"server": f"{scheme}://{hostport}",
+                    "username": user, "password": pw}
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            return {"server": f"{scheme}://{host}:{port}",
+                    "username": user, "password": pw}
+        if len(parts) == 2:
+            return {"server": f"{scheme}://{proxy}"}
+        return {"server": f"{scheme}://{proxy}"}
+    except Exception:
+        return None
+
+
+# The picture challenge is recognised by the words it uses: "tap on the
+# buildings", "click on the images" and so on.  The empty placeholders
+# are always in the page, so counting them says nothing at all, and the
+# "please try again / verify" prompt is not a picture either.
+_IMAGE_WORDS = ("tap on", "click on", "select all", "choose all",
+                "find things", "find the", "things you would",
+                "press enter", "images of", "which of the",
+                "two groups with the same", "one group with the same",
+                "objects that", "people that", "animals that",
+                "vehicles that", "food and", "hot and cold",
+                "usually spray", "commonly have")
+
+
+async def _image_challenge_up(page):
+    """Has the picture challenge come up?
+
+    The picture challenge is not worth solving: it needs a person or a
+    model that can see.  So when it shows up the solver stops at once
+    instead of sitting there until the time runs out.
+    """
+    for frame in page.frames:
+        if "hcaptcha" not in frame.url and "frame=challenge" not in frame.url:
+            continue
+        try:
+            text = await frame.locator("body").inner_text(timeout=1500)
+        except Exception:
+            text = ""
+        low = (text or "").lower()
+        for word in _IMAGE_WORDS:
+            if word in low:
+                return True
+    return False
+
+
+async def _what_it_showed(page):
+    """What the captcha put on the page, in words.
+
+    The frames of the captcha are the only way to tell a picture
+    challenge from a box that was never there, so the words are written
+    down when the run ends.
+    """
+    parts = []
+    for frame in page.frames:
+        if "hcaptcha" not in frame.url and "challenge" not in frame.url:
+            continue
+        try:
+            text = (await frame.locator("body").inner_text(timeout=1200)) or ""
+        except Exception:
+            text = ""
+        text = " ".join(text.split())
+        if not text or text in ("I am human Privacy - Terms", "Verify EN"):
+            continue
+        if text not in parts:
+            parts.append(text[:150])
+    return " / ".join(parts[:3])
+
+
+async def _click_the_verify(page):
+    """Click the Verify button.
+
+    The enterprise captcha puts up a "please try again" and a Verify
+    button in the challenge frame.  Clicking that is what asks for the
+    answer, and without it nothing comes back.
+    """
+    for frame in page.frames:
+        if "hcaptcha" not in frame.url:
+            continue
+        for sel in ("text=/^verify$/i", "text='Verify'", "[class*='verify']",
+                    "[id*='verify']", "a:has-text('Verify')",
+                    "div:has-text('Verify')", "span:has-text('Verify')"):
+            try:
+                el = frame.locator(sel).first
+                if await el.count():
+                    await el.click(timeout=4000)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+async def _click_the_box(page):
+    """Click the captcha checkbox, the way a visitor would.
+
+    hCaptcha shows a checkbox before it hands the token over, and
+    without the click it never gives one.
+    """
+    for frame in page.frames:
+        try:
+            box = frame.locator("#checkbox")
+            if await box.count():
+                el = box.first
+                spot = await el.bounding_box()
+                if spot:
+                    x = spot["x"] + spot["width"] / 2
+                    y = spot["y"] + spot["height"] / 2
+                    await page.mouse.move(x - 70, y - 50, steps=14)
+                    await page.wait_for_timeout(140)
+                    await page.mouse.move(x, y, steps=9)
+                    await page.wait_for_timeout(110)
+                    await page.mouse.down()
+                    await page.wait_for_timeout(80)
+                    await page.mouse.up()
+                else:
+                    await el.click(timeout=3000)
+                return True
+        except Exception:
+            continue
+    try:
+        box = page.locator("input[type=checkbox]")
+        if await box.count():
+            await box.first.click(timeout=3000)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# what the last run ran into, so the log says which one it was
+LAST_REASON = ""
+
+# The pages that are open, by address.  A browser and a page take a
+# while to come up, and the answer of a captcha that is only a box
+# comes in about a second after the box is clicked.  So the page is
+# kept open between the cards and only the answer is worked out again:
+# the card does not wait for a browser to start.
+_THE_PAGE = {"url": "", "page": None}
+
+
+async def _a_page(ctx, url):
+    """The page for this address, opened once and kept.
+
+    Only one page is kept.  A machine with little memory must not fill
+    up with the pages of every address that came before, so the page of
+    the last address is closed when another address comes.
+    """
+    page = _THE_PAGE.get("page")
+    if page is not None:
+        try:
+            if not page.is_closed() and _THE_PAGE.get("url") == url:
+                return page
+            await page.close()
+        except Exception:
+            pass
+    page = await ctx.new_page()
+    _THE_PAGE["url"] = url
+    _THE_PAGE["page"] = page
+    return page
+
+
+class _BrowserNotUsable(Exception):
+    """The browser is in a state the card cannot be answered in.
+
+    It is used when the browser was left half changed: the answer would
+    come from a browser that is not the one the request comes from, so
+    the card is given back instead of answered wrongly.
+    """
+
+
+async def _solve_in_browser(page_url, timeout=60, proxy=None, extra_js=None,
+                            widget_js=None, widget_arg=None, widget_arg2=None,
+                            fingerprint=None):
+    """The browser work, in a process of its own.
+
+    When the browser dies the driver goes with it, and the driver takes
+    the whole bot down with it.  So the browser is run apart, and the
+    token comes back through a pipe.
+
+    The worker is kept between the cards.  A worker that is started for
+    every card starts a browser for every card, and the browser takes
+    a while to come up and the page takes a while to load.  So the
+    worker is given the cards one after the other, and the browser and
+    the page stay as they are.
+    """
+    import json
+
+    job = {
+        "page_url": page_url,
+        "timeout": timeout,
+        "fingerprint": (fingerprint.wire() if hasattr(fingerprint, "wire")
+                        else fingerprint),
+        "proxy": proxy,
+        "extra_js": extra_js,
+        "widget_js": widget_js,
+        "widget_arg": widget_arg,
+        "widget_arg2": widget_arg2,
+    }
+    me = os.path.abspath(__file__)
+
+    # The worker holds one browser and one page, so only one card may
+    # be with it at a time.  Two cards writing to the same pipe would
+    # give each other the other's answer.
+    async with _THE_WORKER_LOCK:
+        proc = await _the_worker(me)
+        if proc is None:
+            return None
+
+        try:
+            proc.stdin.write((json.dumps(job) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            # The answer is one line of json.  Anything else the worker
+            # says on this pipe is read and put in the log, so the
+            # answer is still found.
+            line = b""
+            for _ in range(40):
+                one = await asyncio.wait_for(proc.stdout.readline(),
+                                             timeout=timeout + 90)
+                if not one:
+                    break
+                if one.strip().startswith(b"{"):
+                    line = one
+                    break
+                logger.info("the browser worker said: %s",
+                            one.decode("utf-8", "replace").strip()[:160])
+        except asyncio.TimeoutError:
+            logger.info("the browser worker took too long and was stopped")
+            await _the_worker_gone(proc)
+            return None
+        except Exception as e:
+            logger.info("the browser worker failed: %s", str(e)[:80])
+            await _the_worker_gone(proc)
+            return None
+
+    if not line:
+        logger.info("the browser worker died, and it ended with %s",
+                    proc.returncode)
+        await _the_worker_gone(proc)
+        return None
+
+    try:
+        answer = json.loads(line.decode("utf-8", "replace"))
+    except Exception:
+        logger.info("the browser worker said nothing that could be read")
+        return None
+
+    global LAST_REASON, LAST_EKEY
+    LAST_REASON = answer.get("reason") or ""
+    LAST_EKEY = answer.get("ekey") or ""
+    token = answer.get("token") or ""
+    if token:
+        logger.info("the local hCaptcha solver got a token")
+    return token or None
+
+
+# The worker of the browser, and the browser it holds.
+_THE_WORKER = {"proc": None}
+
+# Where the words of the worker go.
+_THE_WORKER_LOG = os.environ.get("SOLVER_WORKER_LOG") or "/tmp/lc_worker.log"
+
+# One worker, one card at a time.
+_THE_WORKER_LOCK = asyncio.Lock()
+
+
+async def _the_worker(me):
+    """The worker that holds the browser, started when there is none."""
+    import sys
+
+    proc = _THE_WORKER.get("proc")
+    if proc is not None:
+        if proc.returncode is None:
+            return proc
+        _THE_WORKER["proc"] = None
+    # The worker says what it does on its error pipe, and the pipe is
+    # not thrown away: it goes into the log of the solver, so a word
+    # about a crash is not lost.
+    log = None
+    try:
+        log = open(_THE_WORKER_LOG, "ab", buffering=0)
+    except Exception:
+        log = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, me, "--worker",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=log if log is not None else asyncio.subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logger.info("the browser worker did not start: %s", e)
+        if log is not None:
+            try:
+                log.close()
+            except Exception:
+                pass
+        return None
+    _THE_WORKER["proc"] = proc
+    return proc
+
+
+async def _the_worker_gone(proc):
+    """A worker that will not answer again is put away."""
+    if _THE_WORKER.get("proc") is proc:
+        _THE_WORKER["proc"] = None
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    logger.info("the browser worker was put away")
+
+
+# The answer that was on the page is thrown away, so an old answer can
+# never be handed out as if it were a new one.
+FORGET_JS = """
+() => {
+    try { window.__captchaToken = ''; } catch (e) {}
+    try { window.__captchaEkey = ''; } catch (e) {}
+    try { window.__lc_started = false; } catch (e) {}
+    try { window.__lc_grec_done = false; } catch (e) {}
+    try {
+        const el = document.querySelector(
+            'textarea[name="h-captcha-response"], input[name="cf-turnstile-response"]');
+        if (el) el.value = '';
+    } catch (e) {}
+    try { if (window.__lcTokens) { window.__lcTokens = {}; } } catch (e) {}
+    return true;
+}
+"""
+
+
+# The pictures of a challenge are read by a model, and the model is
+# asked through the key of Gemini.  Without the key the picture
+# challenge cannot be answered here and is left to a person.
+#
+# More than one model may be named, and the next one is tried when the
+# first one is busy: the busiest models answer with a word about the
+# demand, and that is not the pictures' fault.
+# The quick models are used first: they answer about a picture in less
+# than a second, where the others take ten seconds and more because
+# they think about it first.
+_THE_MODELS = [m.strip() for m in
+               (os.environ.get("GEMINI_MODEL")
+                or "gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",")
+               if m.strip()]
+_THE_PICTURE = {"agent": None, "page": None}
+
+
+def _the_pictures_may_be_read():
+    """Whether the pictures of a challenge may be read here.
+
+    The pictures of a challenge are read only when it is said so, and
+    it is said so with SOLVE_PICTURES=1.  A challenge on a site that
+    is not ours is left to the people of that site.
+    """
+    #
+    # The pictures are not read here.  Reading them needs a model, and
+    # the model is somebody else's, and a card may not wait for a
+    # word to somebody else: the answer is worth more when it comes
+    # at once.  So the pictures are noticed, and the card is given its
+    # answer at once, and no word goes anywhere.
+    return False
+
+
+# The picture of a challenge is taken by the picture solver, and the
+# view of a challenge moves about all the time.  Playwright waits for
+# the thing to hold still before it takes the picture, and it never
+# holds still, so the picture is never taken and the waiting ends with
+# a word about a timeout.
+#
+# The movements are put to an end for the picture, and the waiting is
+# given a time of its own.
+def _the_still_picture():
+    try:
+        from playwright.async_api import Locator
+    except Exception:
+        return
+    if getattr(Locator, "_the_still_picture_is_set", False):
+        return
+    _the_own = Locator.screenshot
+
+    async def _the_screenshot(self, **kwargs):
+        kwargs.setdefault("animations", "disabled")
+        kwargs.setdefault("timeout", 15000)
+        kwargs.setdefault("scale", "css")
+        return await _the_own(self, **kwargs)
+
+    Locator.screenshot = _the_screenshot
+    Locator._the_still_picture_is_set = True
+
+
+# The answer of hCaptcha comes back and its body cannot be read then:
+# the browser has let go of it.  So the request is caught on the way
+# and the body is read there, where it is still there.
+#
+# It is not used: catching the answer broke the way hCaptcha asks for
+# the challenge, and the challenge never came.  It is here because the
+# word about it belongs with the code, and the day it is wanted it is
+# one line away.
+async def _the_answer_is_caught(page):
+    async def _the_catch(route):
+        try:
+            answer = await route.fetch()
+            body = await answer.text()
+            await route.fulfill(response=answer, body=body)
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+    try:
+        await page.route("**/getcaptcha/**", _the_catch)
+    except Exception as e:
+        logger.info("the answer of hCaptcha cannot be caught: %s", str(e)[:80])
+
+
+def _the_picture_solver(page):
+    """The solver for the picture challenge, if there is one.
+
+    It is made as soon as the page is open, because it has to see the
+    answer coming back from hCaptcha: the pictures and the questions
+    come in that answer, and a solver that was made afterwards would
+    never see them.
+    """
+    key = os.environ.get("GEMINI_API_KEY") or ""
+    if not key:
+        return None
+    _the_still_picture()
+    if _THE_PICTURE.get("agent") is not None and _THE_PICTURE.get("page") is page:
+        return _THE_PICTURE.get("agent")
+    try:
+        from hcaptcha_challenger.agent import AgentV, AgentConfig
+        # The picture solver writes what it does to the standard
+        # output, and the answer comes back on the standard output of
+        # the worker.  The two would be mixed together and the answer
+        # could not be read, so the words are sent to the error pipe.
+        try:
+            from loguru import logger as _the_words
+            _the_words.remove()
+            _the_words.add(sys.stderr, level="INFO")
+        except Exception:
+            pass
+        first = _THE_MODELS[0] if _THE_MODELS else "gemini-flash-lite-latest"
+        config = AgentConfig(
+            GEMINI_API_KEY=key,
+            CHALLENGE_CLASSIFIER_MODEL=first,
+            IMAGE_CLASSIFIER_MODEL=first,
+            SPATIAL_POINT_REASONER_MODEL=first,
+            SPATIAL_PATH_REASONER_MODEL=first,
+            # The trying of one model after the other is done here,
+            # not inside, so that a busy model does not hold the card
+            # up for the whole time.
+            RETRY_ON_FAILURE=False,
+            # Reading the pictures takes a while: every picture is a
+            # word to a model and a word back, and a challenge has
+            # more than one picture.
+            EXECUTION_TIMEOUT=300,
+            RESPONSE_TIMEOUT=90,
+        )
+        agent = AgentV(page, config)
+    except Exception as e:
+        logger.info("the picture solver is not here: %s", str(e)[:90])
+        return None
+    _THE_PICTURE["agent"] = agent
+    _THE_PICTURE["page"] = page
+    logger.info("the picture solver is here, and reads the pictures with %s",
+                ", ".join(_THE_MODELS))
+    return agent
+
+
+async def _the_pictures_are_read(agent):
+    """The pictures are read, and one model after the other when the
+    first one is busy.
+
+    What came of it is said out loud: the model that was asked, and
+    what it answered.
+    """
+    for model in _THE_MODELS or ["gemini-flash-lite-latest"]:
+        for name in ("CHALLENGE_CLASSIFIER_MODEL", "IMAGE_CLASSIFIER_MODEL",
+                     "SPATIAL_POINT_REASONER_MODEL",
+                     "SPATIAL_PATH_REASONER_MODEL"):
+            try:
+                setattr(agent.config, name, model)
+            except Exception:
+                pass
+        start = time.time()
+        logger.info("the pictures are read with %s", model)
+        try:
+            signal = await asyncio.wait_for(agent.wait_for_challenge(),
+                                            timeout=150)
+            took = time.time() - start
+            logger.info("the pictures were read with %s: %s (%.2fs)", model,
+                        signal, took)
+            return True
+        except Exception as e:
+            took = time.time() - start
+            logger.info("the pictures could not be read with %s (%.2fs): %s",
+                        model, took, str(e)[:140])
+    return False
+
+
+async def _the_loop(page, widget_js, widget_arg, widget_arg2, deadline, state,
+                 agent=None):
+    """Work the answer out of the page that is open.
+
+    The loop is the same whether the page was just loaded or was
+    already there, so the answer can be worked out again without the
+    page being loaded a second time.
+    """
+    global LAST_REASON, LAST_EKEY
+    last_click = 0.0
+    started = time.time()
+    while time.time() < deadline:
+        token = await page.evaluate(TOKEN_JS)
+        if token:
+            try:
+                ekey = await page.evaluate(EKEY_JS)
+            except Exception:
+                ekey = ""
+            if ekey:
+                LAST_EKEY = ekey
+            return token
+        # the page may bring its own widget up, so only put one
+        # up when there is none
+        if widget_js and not state["widget_done"]:
+            try:
+                said = await page.evaluate(widget_js, [widget_arg, widget_arg2])
+                said = (said or "") if isinstance(said, str) else str(said or "")
+                # the widget says what it did, so the words are
+                # read: "loading" is not the same as being up
+                state["widget_done"] = ("the widget is up" in said
+                                        or "widget is up" in said)
+                if "loading" in said:
+                    state["widget_done"] = False
+                if "failed" in said or "outer" in said:
+                    LAST_REASON = said[:120]
+                    state["widget_done"] = True
+            except Exception as e:
+                logger.debug("the widget did not load: %s", e)
+        # The picture challenge is read by a model, if there is one.
+        # It is left to a person when there is not.
+        if await _image_challenge_up(page):
+            if state["picture_seen"]:
+                await page.wait_for_timeout(500)
+                continue
+            state["picture_seen"] = True
+            if agent is None:
+                logger.info("the hCaptcha picture challenge came up, "
+                            "and there is nobody here to read it, "
+                            "so the captcha is left alone")
+                return None
+            # what came with the challenge is said out loud, so it can
+            # be seen that the pictures were there
+            try:
+                payload = getattr(agent, "_captcha_payload", None)
+                n = len(getattr(payload, "tasklist", []) or [])
+                logger.info("the hCaptcha picture challenge came up with "
+                            "%d pictures", n)
+            except Exception:
+                pass
+            logger.info("the hCaptcha picture challenge came up, "
+                        "so the pictures are read")
+            if not await _the_pictures_are_read(agent):
+                logger.info("the pictures were not read, "
+                            "so the captcha is left alone")
+                return None
+            continue
+        # the checkbox the visitor would click
+        if time.time() - last_click > 3:
+            last_click = time.time()
+            try:
+                if await _click_the_box(page):
+                    state["box_ticked"] = True
+            except Exception as e:
+                logger.debug("the checkbox was not clickable: %s", e)
+            # and the verify button, which is what asks for the
+            # answer
+            try:
+                if await _click_the_verify(page):
+                    state["verify_clicked"] = True
+            except Exception as e:
+                logger.debug("the verify button was not clickable: %s", e)
+        # The answer is asked for again and again.  The waiting is
+        # short at first, because the answer comes about a second
+        # after the page is loaded, and half a second of waiting is
+        # half a second the card did not need to wait.
+        waited = time.time() - started
+        await page.wait_for_timeout(100 if waited < 8 else 500)
+    return None
+
+
+
+def _the_name_of_the_browser(words):
+    """The name of the browser, out of the words that came with the
+    work.  Nothing comes back when no name came with the work."""
+    if not words:
+        return None
+    try:
+        import json
+        said = json.loads(words) if isinstance(words, str) else words
+    except Exception:
+        return None
+    if not isinstance(said, dict):
+        return None
+    try:
+        from browser_identity import Fingerprint
+        hints = said.get("hints") or {}
+        platform = hints.get("platform") or "Linux"
+        system = {"Windows": "Windows NT 10.0; Win64; x64",
+                  "macOS": "Macintosh; Intel Mac OS X 10_15_7"}.get(
+                      platform, "X11; Linux x86_64")
+        language = said.get("language") or "en-US,en;q=0.9"
+        screen = tuple(said.get("screen") or (1920, 1080, 24))
+        return Fingerprint(system, platform, language, screen,
+                           ua=said.get("user_agent"))
+    except Exception:
+        return None
+
+async def _solve_in_a_process(page_url, timeout=60, proxy=None, extra_js=None,
+                              widget_js=None, widget_arg=None, widget_arg2=None,
+                              fingerprint=None):
+    """Open the page in a real browser and read the token out of it."""
+    global LAST_REASON
+    LAST_REASON = ""
+    launch = {
+        "headless": not bool(os.environ.get("DISPLAY")),
+        # The widget of a captcha is an iframe of another site, so the
+        # site isolation is left on: turning it off, or limiting the
+        # browser to one renderer, makes the browser refuse that iframe
+        # and the widget never comes up.
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                 "--disable-blink-features=AutomationControlled",
+                 "--window-size=1366,900"],
+    }
+    pw_proxy = _playwright_proxy(proxy)
+    if pw_proxy:
+        launch["proxy"] = pw_proxy
+
+    if True:
+        try:
+            await _close_browser_if_idle()
+            ctx = await _get_browser(launch)
+            # The real chrome is harder to tell apart than the bundled
+            # one, and a saved profile looks like a browser that has
+            # been used before.
+            await ctx.add_init_script(STEALTH)
+            if extra_js:
+                await ctx.add_init_script(extra_js)
+            # The page is kept open between the cards, so the scripts
+            # above are on it and the card does not wait for a browser
+            # to start.  The page that was open when the profile loaded
+            # has none of them, so it is not used.
+            page = await _a_page(ctx, page_url)
+            # The picture solver is made with the page, because it has
+            # to see the answer that brings the pictures.
+            agent = (_the_picture_solver(page)
+                     if _the_pictures_may_be_read() else None)
+
+            if agent is None and _the_pictures_may_be_read():
+                logger.info("the picture solver could not be made")
+            # The browser is told which browser it is, so the token it
+            # wins belongs to the browser the request comes from.
+            #
+            # It must not be able to hold the card up.  The page does
+            # not wait for it, and if it does not come back the solve
+            # goes on without it: without this, one slow call lost the
+            # whole card, and the browser worker was stopped at its
+            # limit with the captcha never even asked for.
+            if apply_browser_identity is not None:
+                try:
+                    await asyncio.wait_for(
+                        apply_browser_identity(page, fingerprint=fingerprint),
+                        timeout=15)
+                except Exception as e:
+                    # The browser was left half told what it is, so it
+                    # cannot be used: the answer would come from a
+                    # browser that is not the one the request comes
+                    # from.  The page is thrown away and the card is
+                    # given back, rather than answered wrongly.
+                    logger.info("the browser was not told which browser it "
+                                "is: %s", str(e)[:70])
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    raise _BrowserNotUsable(
+                        "the browser was not told which browser it is")
+            # The page's own script keeps the load going, so waiting for
+            # the whole load to finish waits for the time out and no
+            # sooner.  The load is waited for as far as the first answer
+            # comes back, and the frame is looked for after that.
+            state = {"widget_done": False, "box_ticked": False,
+                     "verify_clicked": False, "picture_seen": False}
+
+            # The page is loaded again for every card.  Google's
+            # reCAPTCHA v3 answers once for a page and not again, so a
+            # page that has answered cannot answer a second time.  The
+            # browser is kept, though, and that is where the time goes:
+            # the browser takes about a second to come up, and the
+            # loading of the page is about a second and a half.
+
+            # The page's own script keeps the load going, so waiting for
+            # the whole load to finish waits for the time out and no
+            # sooner.  The load is waited for as far as the first answer
+            # comes back, and the frame is looked for after that.
+            await page.goto(page_url, wait_until="commit", timeout=45000)
+            # The load is not waited for: the answer is waited for, and
+            # the loop asks the page again and again.
+            await page.wait_for_timeout(100)
+
+            deadline = time.time() + timeout
+            token = await _the_loop(page, widget_js, widget_arg,
+                                    widget_arg2, deadline, state,
+                                    agent=agent)
+            if token:
+                return token
+
+            # The reason is worked out from what really happened, and
+            # what the captcha showed is written down with it.
+            shown = await _what_it_showed(page)
+            if state["picture_seen"]:
+                LAST_REASON = ("the box was ticked, and hCaptcha answered with a "
+                               "picture challenge")
+            elif state["verify_clicked"] and state["box_ticked"]:
+                LAST_REASON = ("the box was ticked and the verify was pressed, "
+                               "but no token came")
+            elif state["verify_clicked"]:
+                LAST_REASON = "the verify was pressed, but no token came"
+            elif state["box_ticked"]:
+                LAST_REASON = "the box was ticked, but no token came"
+            elif shown:
+                LAST_REASON = f"the captcha showed: {shown}"
+            else:
+                LAST_REASON = "the box was not there to click"
+            logger.info("the captcha run ended: %s | it showed: %s",
+                        LAST_REASON, shown or "nothing")
+            return None
+        finally:
+            # the browser stays open for the next card
+            pass
+
+
+def _budget(default=60):
+    """How long a captcha may take, from the environment."""
+    try:
+        return int(os.environ.get("CAPTCHA_TIMEOUT", "") or default)
+    except Exception:
+        return default
+
+
+# How many addresses one solve tries.  Every address costs a browser
+# of its own, and the card has only so much time.
+MAX_ADDRESSES_PER_SOLVE = int(os.environ.get("CAPTCHA_ADDRESSES", "4") or 4)
+
+# The addresses that answered the last time, and when that was.  A run
+# asks for the same addresses over and over, so the answer is
+# remembered instead of being asked for again.
+_ALIVE_UNTIL = 0.0
+_ALIVE_LIST = []
+
+
+async def _keep_the_working_ones(attempts):
+    """The addresses that answer, and only those.
+
+    The addresses are asked all at once, because one that takes its
+    time holds up the whole run.  The answer is remembered for a while,
+    so the next card does not pay for it again.
+    """
+    global _bad_proxies, _ALIVE_UNTIL, _ALIVE_LIST
+    if len(attempts) < 2:
+        return attempts
+
+    now = time.time()
+    if _ALIVE_LIST and now < _ALIVE_UNTIL:
+        known = set(_ALIVE_LIST)
+        alive = [px for px in attempts if px in known]
+        if alive:
+            logger.info("the addresses that answer: %s of %s (known)",
+                        len(alive), len(attempts))
+            return alive
+
+    import httpx
+
+    async def ask(px):
+        """Ask the address if it is there.
+
+        Three answers: it answered, it is not there, or it was slow.
+        A slow one is not marked dead: it may well answer the next
+        time, and an address that is wrongly put aside is one the
+        captcha never gets to try.
+        """
+        pw = _playwright_proxy(px)
+        if not pw:
+            # the direct address always answers
+            return px, True
+        url = pw.get("server", "")
+        if url.startswith("http://"):
+            url = url[7:]
+        auth = ""
+        if pw.get("username"):
+            auth = "%s:%s@" % (pw.get("username"), pw.get("password"))
+        try:
+            r = await asyncio.to_thread(
+                httpx.get, "https://api.ipify.org", timeout=20,
+                proxy="http://%s%s" % (auth, url))
+            return px, (r.status_code == 200)
+        except httpx.ConnectError:
+            return px, False
+        except httpx.ConnectTimeout:
+            return px, False
+        except Exception:
+            return px, None
+
+    # a few at a time.  These addresses share a host, so only a couple
+    # of them answer at once: too many at once and they all time out.
+    gate = asyncio.Semaphore(4)
+
+    async def ask_one(px):
+        async with gate:
+            return await ask(px)
+
+    answers = await asyncio.gather(*[ask_one(px) for px in attempts],
+                                   return_exceptions=True)
+    alive = []
+    for answer in answers:
+        if not isinstance(answer, tuple):
+            continue
+        px, ok = answer
+        if ok is True:
+            alive.append(px)
+        elif ok is False:
+            _bad_proxies.add(px)
+        # a slow one is left alone
+
+    _ALIVE_LIST = list(alive)
+    _ALIVE_UNTIL = time.time() + 600
+    logger.info("the addresses that answer: %s of %s",
+                len(alive), len(attempts))
+    return alive or attempts[:1]
+
+
+async def solve_in_the_frame(page_url, sitekey, rqdata=None, proxy=None,
+                             timeout=60, want=None, page=None):
+    """The answer, asked for inside the frame the page put it in.
+
+    Stripe does not put its captcha on the page the buyer is on: it
+    puts it in an invisible frame from its own content network, and the
+    captcha is told the host of that frame.  A captcha asked for on the
+    page is a different captcha, and it is answered with a picture
+    instead of an answer.
+
+    So the page is opened, the frame is found, and the answer is asked
+    for inside it, with the key and the request data the page came
+    with.
+
+    The page holds two captchas and they are not the same one.  The
+    one that belongs to the payment intent is in a frame of its own,
+    and its address carries the key, the request data and the address
+    the answer is handed to.  When that key is asked for, that frame is
+    the one to ask in, and the box it puts up is ticked.
+    """
+    global LAST_REASON, LAST_EKEY, LAST_STRIPE_TOKEN, LAST_STRIPE_RQDATA
+    LAST_REASON = ""
+    LAST_EKEY = ""
+    LAST_STRIPE_TOKEN = ""
+    LAST_STRIPE_RQDATA = ""
+
+    try:
+        from gates.stripe_captcha import (ASK_THE_CAPTCHA, READ_THE_ANSWER,
+                                          WATCH_THE_CAPTCHA, frame_host)
+    except Exception as e:
+        logger.info("the stripe captcha helper is missing: %s", e)
+        return None
+
+    from playwright.async_api import async_playwright
+
+    launch = {
+        "headless": not bool(os.environ.get("DISPLAY")),
+        # The widget of a captcha is an iframe of another site, so the
+        # site isolation is left on: turning it off, or limiting the
+        # browser to one renderer, makes the browser refuse that iframe
+        # and the widget never comes up.
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                 "--disable-blink-features=AutomationControlled",
+                 "--window-size=1366,900"],
+    }
+    pw_proxy = _playwright_proxy(proxy)
+    if pw_proxy:
+        launch["proxy"] = pw_proxy
+
+    browser = None
+    pw = None
+    own_browser = False
+    try:
+        if page is not None:
+            # The browser is already open, so the answer is asked for
+            # in it and the page is only opened again.  That is much
+            # quicker than starting a browser for every card.
+            ctx = page.context
+        else:
+            own_browser = True
+            pw = await async_playwright().start()
+            try:
+                ctx = await pw.chromium.launch_persistent_context(
+                    _profile_dir(), **_the_browser(), bypass_csp=True,
+                    **PAGE_OPTIONS, **launch)
+            except Exception:
+                _clear_the_lock()
+                b2 = await pw.chromium.launch(**launch)
+                ctx = await b2.new_context(bypass_csp=True, **PAGE_OPTIONS)
+            await ctx.add_init_script(STEALTH)
+            # the hook is on every frame, so what stripe's own captcha is
+            # asked for is known
+            await ctx.add_init_script(WATCH_THE_CAPTCHA)
+            page = await ctx.new_page()
+            if apply_browser_identity is not None:
+                await apply_browser_identity(page, client_hints_metadata())
+        # The page's own script keeps the load going, so waiting for
+        # the whole load to finish waits for the time out and no
+        # sooner.  The load is waited for as far as the first answer
+        # comes back, and the frame is looked for after that.
+        await page.goto(page_url, wait_until="commit", timeout=45000)
+        await page.wait_for_timeout(1200)
+
+        # The captcha is put up by stripe's own code, a few seconds
+        # after the page opens, and the frame it lands in is replaced
+        # while it loads.  So every frame is asked, again and again,
+        # until one of them holds the captcha.
+        #
+        # The one that belongs to the payment intent is in a frame of
+        # its own, and that frame is the one to ask in when that key is
+        # wanted.
+        frame = None
+        intent_frame = None
+        deadline = time.time() + 18
+        while time.time() < deadline:
+            for candidate in page.frames:
+                url = candidate.url or ""
+                if "hcaptcha-inner" in url:
+                    intent_frame = candidate
+                    continue
+                try:
+                    if not await candidate.evaluate("!!window.hcaptcha"):
+                        continue
+                except Exception:
+                    continue
+                if frame is None:
+                    frame = candidate
+            # when the intent's captcha is wanted, its own frame is
+            # the one that is needed, and nothing else will do
+            if want == "intent":
+                if intent_frame is not None:
+                    break
+            elif frame is not None:
+                break
+            await page.wait_for_timeout(250)
+
+        if want == "intent" and intent_frame is not None:
+            frame = intent_frame
+            logger.info("the frame that holds the intent's captcha: %s",
+                        (frame.url or "")[:70])
+            # that frame's own address says which key and which request
+            # data the challenge is about, and they are the ones that
+            # have to be asked for
+            try:
+                tail = (frame.url or "").split("#", 1)[-1]
+                for part in tail.split("&"):
+                    if "=" not in part:
+                        continue
+                    name, value = part.split("=", 1)
+                    value = _unquote(value)
+                    if name == "sitekey" and value:
+                        sitekey = value
+                    elif name == "rqdata" and value:
+                        rqdata = value
+                logger.info("the intent's captcha is about the key %s",
+                            (sitekey or "?")[:24])
+            except Exception as e:
+                logger.info("the intent's captcha could not be read: %s", e)
+        elif frame is None:
+            if intent_frame is not None:
+                frame = intent_frame
+            else:
+                LAST_REASON = "the captcha never loaded on the page"
+                logger.info("the captcha never loaded on the page")
+                return None
+        try:
+            host = frame_host(frame.url) or ""
+        except Exception:
+            host = ""
+
+        try:
+            seen = await frame.evaluate("JSON.stringify(window.__lcSeen || [])")
+            logger.info("what stripe's own captcha was asked for: %s", str(seen)[:300])
+        except Exception:
+            pass
+
+        # Stripe's own captcha is put up and asked for by stripe's own
+        # script, with the request data that belongs to the page now.
+        # The answer it gives is the answer for that request data, so
+        # it is the answer stripe is waiting for.
+        try:
+            stripe_rq = (await frame.evaluate(
+                "(window.__lcRqdata && window.__lcRqdata[%s]) || ''"
+                % json.dumps(sitekey or ""))) or ""
+            if stripe_rq:
+                LAST_STRIPE_RQDATA = stripe_rq
+                logger.info("the request data stripe gave its captcha: %s",
+                            stripe_rq[:30])
+        except Exception:
+            pass
+
+        said = await frame.evaluate(ASK_THE_CAPTCHA, [sitekey, rqdata or "", host])
+        logger.info("the captcha in the frame says: %s (the host is %s)", said, host or "?")
+
+        deadline = time.time() + max(12, min(timeout, 30))
+        ticked = 0
+        while time.time() < deadline:
+            await page.wait_for_timeout(800)
+            # the captcha of the payment intent puts up a box that has
+            # to be ticked, so it is ticked when it shows
+            for candidate in page.frames:
+                url = candidate.url or ""
+                if "hcaptcha.com/captcha" not in url or "frame=checkbox" not in url:
+                    continue
+                try:
+                    did = await candidate.evaluate(TICK_THE_BOX)
+                    if did == "ticked":
+                        ticked += 1
+                        logger.info("the captcha's box was ticked (%d)", ticked)
+                except Exception:
+                    pass
+            try:
+                stripe_token = (await frame.evaluate(
+                    "(window.__lcTokens && window.__lcTokens[%s]) || ''"
+                    % json.dumps(sitekey or ""))) or ""
+                if stripe_token:
+                    LAST_STRIPE_TOKEN = stripe_token
+                    logger.info("stripe's own captcha gave the answer (%d chars)",
+                                len(stripe_token))
+                    return stripe_token
+            except Exception:
+                pass
+            answer = await frame.evaluate(READ_THE_ANSWER)
+            token = answer.get("token") or ""
+            if token:
+                LAST_EKEY = answer.get("ekey") or ""
+                logger.info("the captcha in the frame gave the answer")
+                return token
+        LAST_REASON = "the captcha in the frame gave no answer"
+        logger.info("the captcha in the frame gave no answer")
+        return None
+    except Exception as e:
+        LAST_REASON = "%s: %s" % (type(e).__name__, str(e)[:80])
+        logger.info("the captcha in the frame failed: %s", e)
+        return None
+    finally:
+        try:
+            if browser is not None:
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if pw is not None:
+                await pw.stop()
+        except Exception:
+            pass
+
+
+async def solve_hcaptcha_local(sitekey, pageurl, rqdata=None, proxy=None,
+                               timeout=0, fingerprint=None):
+    """An hCaptcha token, straight from a browser.
+
+    The first try goes out the way the caller asked.  If the picture
+    challenge comes up, the other addresses are tried, because hCaptcha
+    gives the picture to an address it does not like, and a different
+    address often gets the plain box.
+    """
+    global _bad_proxies
+    if not pageurl:
+        return None
+    if not timeout:
+        # Reading the pictures takes longer than clicking a box, and
+        # the card waits for it.
+        timeout = _budget(400 if _the_pictures_may_be_read() else 60)
+
+    attempts = []
+    if proxy:
+        # The answer belongs to the address that asked for it, so the
+        # address the caller named is the only one that is asked.
+        attempts.append(proxy)
+    else:
+        for p in _working_proxies():
+            if p not in attempts:
+                attempts.append(p)
+    # the addresses that work are found first, so the run does not
+    # waste its time on the ones that are dead
+    attempts = await _keep_the_working_ones(attempts)
+
+    # The whole solve has to fit in the time the card has.  Every
+    # address costs a browser of its own, so only a few are tried, and
+    # the time that is left is what each one gets.
+    deadline = time.time() + timeout
+    left = len(attempts)
+    if left > MAX_ADDRESSES_PER_SOLVE:
+        left = MAX_ADDRESSES_PER_SOLVE
+        attempts = attempts[:left]
+
+    last = ""
+    for i, px in enumerate(attempts):
+        left = deadline - time.time()
+        if left <= 10:
+            logger.info("the local hCaptcha solver ran out of time")
+            break
+        # the last address gets what is left, the others a share of it
+        share = max(20, int(left / max(1, len(attempts) - i)))
+        try:
+            token = await _solve_in_browser(
+                pageurl, timeout=min(share, 90, fingerprint=fingerprint), proxy=px,
+                widget_js=HCAPTCHA_WIDGET, widget_arg=sitekey, widget_arg2=rqdata)
+        except Exception as e:
+            logger.info("the local hCaptcha solver failed: %s", e)
+            last = str(e)[:80]
+            # a proxy that cannot open a page is not asked again
+            if px and ("ERR_" in last or "Timeout" in last or "timeout" in last):
+                _bad_proxies.add(px)
+            continue
+        if token:
+            logger.info("the local hCaptcha solver got a token")
+            return token
+        last = LAST_REASON or "no reason given"
+        if "picture" in last:
+            # this address gets the picture, so it is not asked again
+            _bad_proxies.add(px)
+            logger.info("the picture came up on %s, trying another address",
+                        (px.split(":")[0] if px else "the direct one"))
+        elif "no token came" in last or "not there to click" in last:
+            # the box was there and the answer never came.  Another
+            # address is worth a try: the answer is often refused
+            # because too many captchas came from the same one.
+            logger.info("no token came on %s, trying another address",
+                        (px.split(":")[0] if px else "the direct one"))
+        else:
+            # the page itself is wrong, so another address will not
+            # help either
+            break
+    logger.info("the local hCaptcha solver found no token: %s",
+                last or "no reason given")
+    return None
+
+
+async def solve_recaptcha_v3_local(sitekey, pageurl, proxy=None, timeout=0,
+                                  fingerprint=None):
+    """A reCAPTCHA v3 token, straight from a browser."""
+    if not pageurl:
+        return None
+    if not timeout:
+        timeout = _budget(60)
+    try:
+        token = await _solve_in_browser(
+            pageurl, timeout=timeout, proxy=proxy, extra_js=RECAPTCHA_HOOK,
+            widget_js=RECAPTCHA_WIDGET, widget_arg=sitekey, fingerprint=fingerprint)
+        if token:
+            logger.info("the local reCAPTCHA solver got a token")
+            return token
+        logger.info("the local reCAPTCHA solver found no token")
+    except Exception as e:
+        logger.info("the local reCAPTCHA solver failed: %s", e)
+    return None
+
+
+async def _worker(job):
+    """The browser work, as a program of its own.
+
+    This is what runs in the other process.  The answer comes back as
+    one line of json.
+    """
+    import json
+    token = ""
+    reason = ""
+    ekey = ""
+    try:
+        token = await _solve_in_a_process(
+            job.get("page_url") or "",
+            timeout=job.get("timeout") or 60,
+            fingerprint=_the_name_of_the_browser(job.get("fingerprint")),
+            proxy=job.get("proxy"),
+            extra_js=job.get("extra_js"),
+            widget_js=job.get("widget_js"),
+            widget_arg=job.get("widget_arg"),
+            widget_arg2=job.get("widget_arg2"),
+        ) or ""
+    except Exception as e:
+        reason = "%s: %s" % (type(e).__name__, str(e)[:80])
+        # The whole of it is written down, for the log: a short word
+        # about it does not say where it went wrong.
+        try:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+        except Exception:
+            pass
+    if not reason:
+        reason = LAST_REASON or ""
+    ekey = LAST_EKEY or ""
+    sys.stdout.write(json.dumps({"token": token, "reason": reason, "ekey": ekey}))
+    sys.stdout.flush()
+
+
+async def solve_turnstile_local(sitekey, pageurl, proxy=None, timeout=0,
+                                  action=None, cdata=None, fingerprint=None):
+    """A Turnstile token, straight from a browser."""
+    if not pageurl:
+        return None
+    if not timeout:
+        timeout = _budget(60)
+    try:
+        token = await _solve_in_browser(
+            pageurl, timeout=timeout, proxy=proxy, fingerprint=fingerprint)
+        if token:
+            logger.info("the local Turnstile solver got a token")
+            return token
+        logger.info("the local Turnstile solver found no token")
+    except Exception as e:
+        logger.info("the local Turnstile solver failed: %s", e)
+    return None
+
+
+if __name__ == "__main__" and "--worker" in sys.argv:
+    import json
+    import sys
+
+    async def _run():
+        # The cards come one after the other on the same pipe, so the
+        # browser and the page stay as they are between them.
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                raw = await loop.run_in_executor(None, sys.stdin.readline)
+            except Exception:
+                break
+            if not raw:
+                break
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                job = json.loads(raw)
+            except Exception:
+                job = {}
+            try:
+                await _worker(job)
+            except Exception:
+                pass
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    try:
+        asyncio.run(_run())
+    except Exception:
+        pass
+    os._exit(0)

@@ -1,0 +1,77 @@
+# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+
+# compiled output
+dist
+tmp
+out-tsc
+*.tsbuildinfo
+.expo
+.expo-shared
+
+# dependencies
+node_modules
+
+# IDEs and editors
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# misc
+/.sass-cache
+/connect.lock
+/coverage
+/libpeerconnection.log
+npm-debug.log
+yarn-error.log
+testem.log
+/typings
+
+# System Files
+.DS_Store
+Thumbs.db
+
+.cursor/rules/nx-rules.mdc
+.github/instructions/nx.instructions.md
+
+# Replit
+.cache/
+.local/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# the secret files
+.env
+*.env
+requests.txt
+requests.txt*
+*.bak
+*.bak-*
+
+# the scratch files
+/test_*.py
+/find_*.py
+/find_*.*.py
+/check_sites.py
+/config_temp.json
+hitchk-app/bot/config.json
+hitchk-app/bot/data_snapshot.json
+
+hitchk-app/bot/config.json
+hitchk-app/data_snapshot.json
+hitchk-app/bot/data_snapshot.json
