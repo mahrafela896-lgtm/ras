@@ -1,0 +1,15 @@
+{
+  "TELEGRAM_BOT_TOKEN": "8589911426:AAEBIP4nEVq0OJWwWjA-Xrg8M9BBYQt3ZEA",
+  "TELEGRAM_API_ID": "23455910",
+  "TELEGRAM_API_HASH": "90141cba8edb2622873c97f63ab3ec96",
+  "TELEGRAM_ADMIN_ID": "7622959338",
+  "TELEGRAM_GROUP_ID": "-1003960217262",
+  "TELEGRAM_GROUP_LINK": "https://t.me/asindaa",
+  "charge_sk": "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",
+  "charge_amount": 50,
+  "TELEGRAM_CHANNEL_LINK": "https://t.me/yangkhm",
+  "TELEGRAM_CHANNEL_ID": "@yangkhm",
+  "hitter_site_visible": true,
+  "maintenance_mode": false,
+  "logs_group_id": "-1003960217262"
+}
