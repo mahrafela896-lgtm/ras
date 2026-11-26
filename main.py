@@ -15,6 +15,9 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
+    # pahila web server chalaunus (railway le 502 na dekhos bhanera)
     threading.Thread(target=run_web_server, daemon=True).start()
+    
+    # ani bot chalaunus
     import bot
     bot.client.run_until_disconnected()
