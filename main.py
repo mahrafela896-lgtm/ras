@@ -16,12 +16,12 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # 1. web server start gara
+    # 1. Pahila web server start gara (Railway le 502 na dekhos bhanera)
     threading.Thread(target=run_web_server, daemon=True).start()
     
-    # 2. bot lai start gara
+    # 2. Ani bot start gara
     import bot
-    # client.start() call gara (yo connect garcha)
+    # client.start() le bot lai connect garcha
     asyncio.run(bot.client.start())
-    # ani run_until_disconnected() (yo chaldai rakcha)
+    # run_until_disconnected() le chaldai rakcha
     bot.client.run_until_disconnected()
