@@ -1,7 +1,7 @@
 import threading
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import bot  # yo import garda bot.py bhitra ko code run huncha
+import asyncio
 
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -16,6 +16,10 @@ def run_web_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Railway ko lagi euta dummy web server background ma chalaune
+    # 1. Pahila web server start gar (railway ko lagi)
     threading.Thread(target=run_web_server, daemon=True).start()
-    # bot import garda nai chaldai bascha (assuming bot.py ma client.run_until_disconnected() chha)
+    
+    # 2. Ani bot start gar
+    import bot
+    # telethon ko client lai disconnected hunna bhanera run gara
+    bot.client.run_until_disconnected()
