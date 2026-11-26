@@ -2210,7 +2210,7 @@ async def start(event):
         [Button.inline("\U0001f512 Skool Gate", b"menu_skool"), Button.inline("\U0001f3af Auto Hitter", b"menu_auto_hitter")],
         [Button.inline("\U0001f464 Accounts Checker", b"menu_accounts")],
         [Button.inline("\U0001f4d6 Setup Guide", b"help_back")],
-        [Button.url("\U0001f310 Open Website", "http://72.62.2.181:5000"), Button.url("\U0001f4ac Join Channel", CHANNEL_LINK)],
+        [Button.url("\U0001f310 Open Website", "https://ras-production-19a558d1.up.railway.app"), Button.url("\U0001f4ac Join Channel", CHANNEL_LINK)],
         [Button.url("\U0001f4e9 Contact", f"https://t.me/{ADMIN_USERNAME.replace('@','')}")],
     ]
 
