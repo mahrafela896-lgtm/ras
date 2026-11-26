@@ -1,19 +1,21 @@
-import os
-from flask import Flask
 import threading
-import bot
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import bot  # yo import garda bot.py bhitra ko code run huncha
 
-app = Flask(__name__)
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
 
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_bot():
-    if hasattr(bot, 'main'):
-        bot.main()
+def run_web_server():
+    port = int(os.environ.get("PORT", 5000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server.serve_forever()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    # port 5000 rakheko chha, 0.0.0.0 ma listen garna parcha
-    app.run(host="0.0.0.0", port=5000)
+    # Railway ko lagi euta dummy web server background ma chalaune
+    threading.Thread(target=run_web_server, daemon=True).start()
+    # bot import garda nai chaldai bascha (assuming bot.py ma client.run_until_disconnected() chha)
